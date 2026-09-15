@@ -22,6 +22,8 @@ import csv
 import json
 import os
 import random
+import socket
+import tempfile
 import threading
 import concurrent.futures
 from datetime import datetime
@@ -379,6 +381,202 @@ QLabel#tag_cyan {{
 QSS = build_qss(PAL)
 
 AUTO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcm_config.json")
+RUN_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcm_run.lock")
+
+
+# ─── Config file helpers: atomic writes, and a cross-app run lock ────────────
+# Both the full console and the mini console (dcm_mini_app.py) read and write
+# dcm_config.json, and both must be able to start a run that touches real
+# hardware without racing the other. These are module-level, not methods, so
+# either app can `import dcm_align_app as app` and call `app.<name>` without
+# needing a MainWindow instance.
+
+def _pid_is_running(pid):
+    """Best-effort liveness check for a process id, Windows and POSIX.
+
+    There is no working os.kill(pid, 0) on Windows: unlike POSIX, where
+    signal 0 means "just check, don't deliver", Windows os.kill only accepts
+    SIGTERM and the two CTRL_*_EVENT values -- passing 0 raises OSError
+    rather than probing anything. Rather than pull in psutil as a new
+    dependency, this opens a handle to the process through the raw Win32 API
+    via ctypes (stdlib, nothing to install) and treats "handle obtained" and
+    "access denied" both as running, anything else as not running.
+
+    Stated limitation: PIDs are recycled by the OS, so given enough churn (or
+    a reboot) a dead process's old PID can belong to an unrelated live
+    process, which would make this wrongly report "running". That is a
+    plausibility check for whether to honour a lock file, not a proof of
+    identity -- an acceptable trade here, since the failure mode is an
+    operator seeing one extra "already running" refusal, not a silent
+    double-run on real hardware.
+    """
+    if pid is None:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERROR_ACCESS_DENIED = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def atomic_write_json(path, obj):
+    """Write obj as JSON (indent=2) via a temp file in the same directory,
+    then os.replace() onto the target. Returns (ok: bool, reason: str).
+
+    os.replace() is atomic on both POSIX and Windows -- unlike os.rename(),
+    which raises on Windows when the destination already exists -- so a
+    reader never observes a partially written file, and a crash or a second
+    writer mid-write leaves the previous good file in place rather than
+    truncated JSON.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".dcm_tmp_", suffix=".json", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(obj, f, indent=2)
+            os.replace(tmp_path, path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, exc)
+    return True, "ok"
+
+
+def load_config_file(path=None):
+    """Read the whole config JSON and return it as a dict.
+
+    Defaults to the CURRENT value of the module-level AUTO_CONFIG_PATH,
+    looked up at call time rather than captured as a default-argument value
+    -- tests/_harness.py rebinds app.AUTO_CONFIG_PATH for test isolation, and
+    a default argument would freeze the path from before that rebind, which
+    is exactly the isolation mechanism this has to respect. Returns {} if the
+    file is absent, unparseable, or not a JSON object; never raises. Callers
+    that need to distinguish "no file" from "empty config" should check
+    os.path.exists() themselves first.
+    """
+    p = path or AUTO_CONFIG_PATH
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config_section(section, data, path=None):
+    """Set cfg[section] = data in the config file and write it back atomically.
+
+    Re-reads the file immediately before writing, rather than working from a
+    snapshot taken earlier, so every other top-level key -- including one
+    owned by a different process sharing the same file -- survives untouched.
+    A stashed-at-load-time snapshot would let this silently overwrite a
+    section a second app wrote more recently than this process's own load.
+    Returns (ok, reason).
+    """
+    p = path or AUTO_CONFIG_PATH
+    cfg = load_config_file(p)
+    cfg[section] = data
+    return atomic_write_json(p, cfg)
+
+
+def read_run_lock(path=None):
+    """Return the current run lock as a dict, or None if there is none.
+
+    The dict carries pid, host, app, started (an ISO 8601 string) as written
+    by acquire_run_lock(), plus a bool 'stale' that is True when that pid is
+    no longer running (see _pid_is_running() for what that check can and
+    cannot prove). Returns None when the lock file is absent or unparseable
+    -- an unreadable lock is treated the same as no lock, since acquiring one
+    would overwrite it regardless.
+    """
+    p = path or RUN_LOCK_PATH
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    result = dict(data)
+    result["stale"] = not _pid_is_running(data.get("pid"))
+    return result
+
+
+def acquire_run_lock(app_name, path=None):
+    """Claim the run lock for this process. Returns (ok, holder).
+
+    holder is None when ok is True. When ok is False, holder is the blocking
+    lock dict (see read_run_lock()) belonging to whoever holds it. A lock
+    whose pid is no longer running is stale and is overwritten here rather
+    than honoured -- its own process is gone, so nothing else would ever
+    clear it. (Callers that want to ask the operator before overriding a
+    stale lock should read_run_lock() first and only call this after they
+    decide to proceed; this function itself does not ask.) Re-acquiring a
+    lock this same process already holds succeeds and refreshes 'started'.
+    """
+    p = path or RUN_LOCK_PATH
+    existing = read_run_lock(p)
+    if (existing is not None and not existing.get("stale")
+            and existing.get("pid") != os.getpid()):
+        return False, existing
+    lock = {
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "app": app_name,
+        "started": datetime.now().isoformat(timespec="seconds"),
+    }
+    ok, reason = atomic_write_json(p, lock)
+    if not ok:
+        # Could not even write the lock file -- treat that as "the lock could
+        # not be claimed" rather than silently letting the run proceed
+        # unlocked, which would defeat the whole point of having one.
+        return False, {"pid": None, "host": "", "app": app_name, "started": "",
+                       "stale": False, "error": reason}
+    return True, None
+
+
+def release_run_lock(path=None):
+    """Remove the run lock if, and only if, this process owns it. Never raises."""
+    p = path or RUN_LOCK_PATH
+    try:
+        lock = read_run_lock(p)
+        if lock is None or lock.get("pid") != os.getpid():
+            return
+        os.remove(p)
+    except Exception:
+        pass
+
 
 MOTOR_PV_KEYS = {"mono_energy", "roll", "pitch", "mir_slit_top", "mir_slit_bot",
                  "mir_pitch_motor"}
@@ -953,6 +1151,7 @@ class AlignmentWorker(QObject):
         self._faulted_pvs     = set()   # distinct PVs that have faulted this run
         self._ca_hint_shown   = False
         self._is_motor        = {}      # pv name -> bool, filled by pre-flight
+        self._rtype           = {}      # pv name -> .RTYP string or None, filled by pre-flight
         self._deadbands       = {}      # motor pv -> arrival tolerance
         self.epics = EpicsInterface(simulate=simulate)
 
@@ -1724,9 +1923,21 @@ class AlignmentWorker(QObject):
         """Connect-test everything the run needs, before anything moves.
 
         Runs in the worker thread under its own CA context, so it also proves
-        the context attach worked. Serial rather than a thread pool: ad-hoc
-        threads would each need their own attach, and the probes are sub-second
-        when the IOCs are up.
+        the context attach worked. The connection pass below runs concurrently
+        in a ThreadPoolExecutor: probe_pv() calls epics.ca.use_initial_context()
+        itself on every call, so each pool thread attaches its own CA context
+        exactly as this thread did -- SetupTab._test_epics() already runs the
+        same probe_pv() concurrently for the same reason. (This used to be
+        serial on the theory that ad-hoc threads would each need their own
+        attach; that theory does not hold for probe_pv, which handles it
+        itself, so it no longer justifies paying for every PV one at a time.)
+
+        Motor/plain classification reads .RTYP -- a dbCommon field every
+        record type answers immediately, connected or not deliberately timed
+        out -- instead of burning a full timeout on a .DMOV probe for every
+        plain record. A PV whose .RTYP does not answer (or answers with
+        something unreadable) falls back to the old .DMOV probe for that PV
+        alone, since some sites front a motor with a non-'motor' record.
         """
         self.log("━━ Pre-flight — checking PV connections ━━")
         if self.simulate:
@@ -1734,32 +1945,78 @@ class AlignmentWorker(QObject):
             self.preflight_report.emit([("(simulation)", "", "skipped")])
             return
         while True:
+            required = self._required_pvs()
             rows, bad = [], []
-            for label, name, try_rbv, _w in self._required_pvs():
-                self._pause_point()
-                if self._abort:
-                    raise PVFaultAbort("(pre-flight)", "aborted during pre-flight")
+
+            # ── Connection pass: concurrent, one probe per unique PV name ──
+            # _required_pvs() already dedupes by name, but a blank name is
+            # never probed and several labels could in principle still share
+            # one name, so dedupe again here defensively before submitting.
+            to_probe = {}   # name -> try_rbv (first row for that name wins)
+            for _label, name, try_rbv, _w in required:
+                if name and name not in to_probe:
+                    to_probe[name] = try_rbv
+            probe_results = {}   # name -> (ok, detail)
+            if to_probe:
+                # Not a `with` block: Executor.__exit__ calls shutdown(wait=True),
+                # which would block on every still-in-flight probe_pv() call
+                # before an abort raised inside the loop could actually
+                # propagate -- silently reintroducing the serial stall this
+                # rewrite exists to remove. shutdown() is called by hand in
+                # `finally` instead, with wait=False, so an abort returns
+                # immediately and any still-running probes are left to finish
+                # in the background (harmless: probe_pv only reads).
+                ex = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(len(to_probe), 1))
+                try:
+                    futures = {ex.submit(probe_pv, name, 1.0, try_rbv): name
+                               for name, try_rbv in to_probe.items()}
+                    pending = set(futures)
+                    while pending:
+                        done, pending = concurrent.futures.wait(pending, timeout=0.05)
+                        for f in done:
+                            probe_results[futures[f]] = f.result()
+                        # Abort responsiveness lives in the completion wait,
+                        # not per-PV, now that the probes run concurrently.
+                        self._pause_point()
+                        if self._abort:
+                            raise PVFaultAbort("(pre-flight)",
+                                               "aborted during pre-flight")
+                finally:
+                    ex.shutdown(wait=False, cancel_futures=True)
+
+            for label, name, _try_rbv, _w in required:
                 if not name:
                     rows.append((label, "", "not configured"))
                     bad.append(("", "%s has no PV name configured" % label))
                     continue
-                ok, detail = probe_pv(name, timeout=1.0, try_rbv=try_rbv)
+                ok, detail = probe_results.get(name, (False, "not probed"))
                 rows.append((label, name, detail))
                 if not ok:
                     bad.append((name, "did not connect (%s)" % detail))
             n_ok = sum(1 for _l, _p, st in rows if st.startswith("ok"))
 
-            # Classify what we drive. A PV whose .DMOV connects is a motor
-            # record and is awaited via its own flags; anything else is a plain
-            # record whose put-callback is the write confirmation.
+            # ── Classification pass: .RTYP first, .DMOV fallback per PV ──
             self._is_motor = {}
+            self._rtype = {}
             n_motors = 0
             for label, name in self._writable_pvs():
-                is_motor, _d = probe_pv(name + ".DMOV", timeout=1.0)
+                self._pause_point()
+                if self._abort:
+                    raise PVFaultAbort("(pre-flight)", "aborted during pre-flight")
+                rtyp_raw = self.epics.get(name + ".RTYP", as_string=True, timeout=1.0)
+                rtyp = (rtyp_raw or "").strip()
+                self._rtype[name] = rtyp or None
+                if rtyp:
+                    is_motor = (rtyp.lower() == "motor")
+                    type_desc = "motor record" if is_motor else "%s record" % rtyp
+                else:
+                    is_motor, _d = probe_pv(name + ".DMOV", timeout=1.0)
+                    type_desc = ("motor record" if is_motor
+                                 else "plain record (RTYP unavailable)")
                 self._is_motor[name] = is_motor
                 n_motors += 1 if is_motor else 0
-                rows.append((label + "  → type", name,
-                             "motor record" if is_motor else "plain record"))
+                rows.append((label + "  → type", name, type_desc))
             self.preflight_report.emit(rows)
             self.log("  %d of %d driven PVs are motor records."
                      % (n_motors, len(self._is_motor)))
@@ -4271,6 +4528,10 @@ class AlignmentTab(QWidget):
     alignment_done = pyqtSignal(bool)   # emitted after worker finishes; True = success
     run_requested  = pyqtSignal(object)  # set of substep keys, or None for "as ticked"
 
+    # Identifies this app in the run lock file (see acquire_run_lock()) so a
+    # refusal message and a stale-lock prompt can name which app holds it.
+    _RUN_LOCK_APP_NAME = "DCM Alignment Console (full)"
+
     _SUBSTEP_TEXT = {
         "1_1a": "Read Energy table",
         "2_2a": "Turn off BPM feedback",
@@ -4313,6 +4574,7 @@ class AlignmentTab(QWidget):
         self._stripe_future    = None
         self._stripe_pool      = None
         self._stripe_timer     = None
+        self._holds_run_lock   = False  # True while this tab's run owns RUN_LOCK_PATH
         self._build()
         QTimer.singleShot(800, self._refresh_stripe_display)
 
@@ -4659,8 +4921,8 @@ class AlignmentTab(QWidget):
                     _epics.ca.use_initial_context()   # per-thread CA context
                 except Exception:
                     pass
-                vfm = _epics.caget(_STRIPE_VFM_X_PV + ".RBV", timeout=2.0)
-                vdm = _epics.caget(_STRIPE_VDM_X_PV + ".RBV", timeout=2.0)
+                vfm = _epics.caget(_STRIPE_VFM_X_PV + ".RBV", timeout=2.0, connection_timeout=2.0)
+                vdm = _epics.caget(_STRIPE_VDM_X_PV + ".RBV", timeout=2.0, connection_timeout=2.0)
                 if vfm is None or vdm is None:
                     return None
                 for stripe, pos in _STRIPE_POSITIONS.items():
@@ -4781,6 +5043,63 @@ class AlignmentTab(QWidget):
         for btn in self._chapter_run_btn.values():
             btn.setEnabled(on)
 
+    def _acquire_run_lock_or_refuse(self):
+        """Claim RUN_LOCK_PATH for this run, or tell the operator why not.
+
+        Both this console and the mini console write feedback_v/auto_feedback
+        and drive the mirror stages -- starting one mid-run of the other would
+        have them fight over the same PVs. Called right before start_alignment
+        does anything else, so a refusal leaves the UI exactly as it was.
+
+        A live lock (holder pid still running) is a hard refusal: only that
+        operator can clear it. A stale lock (holder pid no longer running,
+        almost always a crash) is offered as an override rather than silently
+        taken -- acquire_run_lock() itself would overwrite it unconditionally,
+        but asking first means an operator who is unsure never does it by
+        accident.
+        """
+        existing = read_run_lock()
+        if existing is not None and not existing.get("stale"):
+            QMessageBox.warning(
+                self, "Alignment already running",
+                "A DCM alignment is already running in %s\n"
+                "on host %s (pid %s), started %s.\n\n"
+                "Wait for it to finish, or ask that operator to abort it, "
+                "before starting another run here." % (
+                    existing.get("app") or "another instance",
+                    existing.get("host") or "an unknown host",
+                    existing.get("pid", "?"),
+                    existing.get("started") or "an unknown time"))
+            return False
+        if existing is not None and existing.get("stale"):
+            reply = QMessageBox.question(
+                self, "Stale run lock",
+                "A run lock recorded for %s\n"
+                "on host %s (pid %s, started %s) is present, but that "
+                "process is no longer running -- most likely it crashed or "
+                "was killed without cleaning up.\n\n"
+                "Override the stale lock and start this run?" % (
+                    existing.get("app") or "another instance",
+                    existing.get("host") or "an unknown host",
+                    existing.get("pid", "?"),
+                    existing.get("started") or "an unknown time"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+        ok, holder = acquire_run_lock(self._RUN_LOCK_APP_NAME)
+        if not ok:
+            # Lost a race with another process between the check above and
+            # the acquire itself.
+            holder = holder or {}
+            QMessageBox.warning(
+                self, "Alignment already running",
+                "Could not claim the run lock -- %s just started a run.\n"
+                "Wait for it to finish before starting another run here."
+                % (holder.get("app") or "another instance"))
+            return False
+        self._holds_run_lock = True
+        return True
+
     def start_alignment(self, pvs=None, scan_params=None, simulate=True,
                         mirror_stages=None, enabled=None):
         if self._running:
@@ -4803,6 +5122,9 @@ class AlignmentTab(QWidget):
             return
         # Chapter 4 is "skipped" exactly when none of its steps is enabled.
         skip_mirror = not any(k.startswith("4_") for k in enabled)
+
+        if not self._acquire_run_lock_or_refuse():
+            return
 
         self._reset_ui()
         self._plot_board.begin_run({
@@ -5013,6 +5335,9 @@ class AlignmentTab(QWidget):
 
     def _on_finished(self, success):
         self._running = False
+        if self._holds_run_lock:
+            release_run_lock()
+            self._holds_run_lock = False
         self._plot_board.end_run()
         self.start_btn.setEnabled(True)
         self.abort_btn.setEnabled(False)
@@ -5225,7 +5550,7 @@ class MirrorTab(QWidget):
                 return (name, pv, "no EPICS")
             try:
                 import epics as _epics
-                val = _epics.caget(pv, timeout=2.0)
+                val = _epics.caget(pv, timeout=2.0, connection_timeout=2.0)
                 if val is None:
                     return (name, pv, "✗  timeout / not found")
                 return (name, pv, f"✓  {val}")
@@ -5458,8 +5783,8 @@ class RecordTab(QWidget):
                         return (label, "—", "no EPICS")
                     try:
                         import epics as _epics
-                        vfm = _epics.caget(_STRIPE_VFM_X_PV + ".RBV", timeout=2.0)
-                        vdm = _epics.caget(_STRIPE_VDM_X_PV + ".RBV", timeout=2.0)
+                        vfm = _epics.caget(_STRIPE_VFM_X_PV + ".RBV", timeout=2.0, connection_timeout=2.0)
+                        vdm = _epics.caget(_STRIPE_VDM_X_PV + ".RBV", timeout=2.0, connection_timeout=2.0)
                         if vfm is None or vdm is None:
                             return (label, "—", "✗  timeout")
                         for s, pos in _STRIPE_POSITIONS.items():
@@ -5479,11 +5804,11 @@ class RecordTab(QWidget):
             try:
                 import epics as _epics
                 if label in _STRING_LABELS:
-                    val = _epics.caget(pv, as_string=True, timeout=2.0)
+                    val = _epics.caget(pv, as_string=True, timeout=2.0, connection_timeout=2.0)
                     if val is None:
                         return (label, pv, "✗  timeout / not found")
                     return (label, pv, f"✓  {val}")
-                val = _epics.caget(pv, timeout=2.0)
+                val = _epics.caget(pv, timeout=2.0, connection_timeout=2.0)
                 if val is None:
                     return (label, pv, "✗  timeout / not found")
                 if label == "XTAL":
@@ -5746,12 +6071,12 @@ class MainWindow(QMainWindow):
                 try:
                     import epics as _epics
                     if label in _STRING_LABELS:
-                        val = _epics.caget(pv, as_string=True)
+                        val = _epics.caget(pv, as_string=True, timeout=2.0, connection_timeout=2.0)
                         row[label] = "—" if val is None else str(val)
                     elif label == "XTAL":
-                        row[label] = fmt_xtal(_epics.caget(pv))
+                        row[label] = fmt_xtal(_epics.caget(pv, timeout=2.0, connection_timeout=2.0))
                     else:
-                        row[label] = fmt_pv_value(_epics.caget(pv))
+                        row[label] = fmt_pv_value(_epics.caget(pv, timeout=2.0, connection_timeout=2.0))
                 except Exception:
                     row[label] = "err"
         self.energy_tab.append_record_row(row)
@@ -5903,12 +6228,23 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Could not restore config: {e}")
 
     def _save_config(self):
+        """Write the auto-save config without destroying keys this app does not own.
+
+        Re-reads the file immediately before writing -- not a snapshot taken
+        at load time, which could restore a stale section over one a second
+        process (the mini console) wrote more recently -- and carries over
+        every top-level key _config_dict() does not produce. The write itself
+        goes through atomic_write_json(), so a crash or a concurrent writer
+        can no longer leave truncated JSON that _auto_load_config() cannot
+        parse on the next launch.
+        """
         cfg = self._config_dict()
-        try:
-            with open(AUTO_CONFIG_PATH, "w") as f:
-                json.dump(cfg, f, indent=2)
-        except Exception:
-            pass
+        own_keys = set(cfg)
+        existing = load_config_file(AUTO_CONFIG_PATH)
+        for key, value in existing.items():
+            if key not in own_keys:
+                cfg[key] = value
+        atomic_write_json(AUTO_CONFIG_PATH, cfg)
 
     def _on_sim_toggled_bpm(self, is_sim: bool):
         if is_sim or not EPICS_AVAILABLE:
@@ -6065,6 +6401,13 @@ class MainWindow(QMainWindow):
         self._stop_bpm_monitoring()
         for panel in self._pv_panels:
             panel._stop_monitoring()
+        # Belt-and-braces: _on_finished() releases the lock too, but that is a
+        # queued cross-thread signal and may not have been delivered yet by
+        # the time we get here (e.g. an abort-on-close above). release_run_lock()
+        # is a no-op unless this process still owns the lock, so calling it
+        # again here is always safe.
+        release_run_lock()
+        self.alignment_tab._holds_run_lock = False
         self._save_config()
         super().closeEvent(event)
 

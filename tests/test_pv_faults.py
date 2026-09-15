@@ -39,12 +39,24 @@ _IDLE_PVS = {app.DEFAULT_PVS["und_busy"]: 0.0,          # undulator not moving
 
 _BPM_PVS = {app.DEFAULT_PVS["bpm_x"], app.DEFAULT_PVS["bpm_y"]}
 
+# Pre-flight now classifies motor vs plain by .RTYP (item 11) instead of timing
+# out a .DMOV probe, so this stub needs an .RTYP answer for every writable PV
+# pre-flight can ask about, or the bare "return 0.5" fallback below would hand
+# back a float where AlignmentWorker._preflight() expects a string/None and
+# crash on .strip(). MOTOR_PV_KEYS is the app's own existing "these PVs are
+# EPICS motor records" set (used for .RBV retry in SetupTab), so it is reused
+# here rather than inventing a second list that could drift from it.
+_MOTOR_PVS = {app.DEFAULT_PVS[k] for k in app.MOTOR_PV_KEYS if app.DEFAULT_PVS.get(k)}
+
 
 def fake_get(self, pv, as_string=False, timeout=3.0):
     if self.simulate:
         return self._sim_vals.get(pv, 0.0)
     if not STATE["get_ok"]:
         return None
+    if pv.endswith(".RTYP"):
+        base = pv[:-len(".RTYP")]
+        return "motor" if base in _MOTOR_PVS else "ao"
     if pv in _IDLE_PVS:
         return _IDLE_PVS[pv]
     for suffix, val in _SETTLED:

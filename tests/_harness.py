@@ -31,6 +31,12 @@ import dcm_align_app as app  # noqa: E402
 # Never let a test write to the operator's real configuration.
 TMPDIR = tempfile.mkdtemp(prefix="dcm_test_")
 app.AUTO_CONFIG_PATH = os.path.join(TMPDIR, "test_config.json")
+# Same isolation for the run lock. Without this a dcm_run.lock left at the repo
+# root by a crashed process would look like a live lock to the next suite, and
+# the stale-lock branch would then depend on whatever silence_dialogs() happens
+# to answer -- a test outcome decided by a stray file. Both functions resolve
+# `path or RUN_LOCK_PATH` at call time, so rebinding the module global is enough.
+app.RUN_LOCK_PATH = os.path.join(TMPDIR, "test_run.lock")
 
 from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 from PyQt6.QtCore import QTimer, QEventLoop           # noqa: E402
