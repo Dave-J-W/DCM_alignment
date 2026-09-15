@@ -9,6 +9,18 @@ import os
 import sys
 import tempfile
 
+# Several app strings the suites echo contain '→' (the arrow in the substep
+# labels). A default Windows console is cp437/cp1252, so printing one raises
+# UnicodeEncodeError from inside Report.check and kills the run mid-suite --
+# losing every result after that point rather than reporting a failure. Force
+# UTF-8 on our own streams so the suites are runnable without the caller having
+# to remember PYTHONIOENCODING.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass   # already redirected to something without reconfigure()
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

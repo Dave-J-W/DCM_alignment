@@ -14,6 +14,20 @@ Each exits non-zero and prints a `FAILURES:` list if anything regresses.
 `test_simulation.py` takes a few minutes, `test_pv_faults.py` about one, and
 `test_config_roundtrip.py` a few seconds.
 
+Green reference on a clean checkout: **44 / 36 / 13 PASS** respectively.
+
+Two things to know before reading a failure as a regression:
+
+- **`test_config_roundtrip.py` needs a `dcm_config.json` to exist**, and it calls
+  `R.fail()` rather than skipping when there is none — so on a fresh clone it fails with
+  *"no dcm_config.json to round-trip against"*. That is a missing input, not a defect.
+  Generate one by launching the console once and closing it; the file is gitignored
+  because it holds machine-specific PV names.
+- **`_harness.py` forces UTF-8 on stdout/stderr.** Several app strings the suites echo
+  contain `→`, and on a default Windows console (cp437/cp1252) printing one used to raise
+  `UnicodeEncodeError` from inside `Report.check`, killing the run mid-suite and losing
+  every result after that point. If you refactor the harness, keep that.
+
 | File | Covers |
 |------|--------|
 | `test_simulation.py` | The full 5-step sequence in every skip-mirror / confirm-each-step combination; per-step and chapter-only runs, including that disabling 4A leaves 4C working from the live slit centre; the eight scan figures, their overlays, distinct trace colours and monotonic x; that a blank stage PV cannot hang the checked-read retry loop; that all six computed scan results reach the lookup table; that the JJC stays open at 4 and closes only just before feedback, in both branches; theme switching; clean window close. |
