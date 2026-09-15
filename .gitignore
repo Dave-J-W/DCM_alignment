@@ -8,3 +8,9 @@ __pycache__/
 
 # Test run artefacts
 *.log
+
+# Operator configuration and run state, written at runtime next to the app.
+# dcm_config.json holds the beamline PV names and the alignment record; it is
+# per-machine and must never be committed.
+dcm_config.json
+dcm_run.lock

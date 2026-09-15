@@ -5,10 +5,30 @@ PyQt6 desktop application for aligning a Double Crystal Monochromator (DCM).
 ## Install
 
 ```bash
-pip install PyQt6 pyqtgraph numpy scipy
-# Optional — only needed for real EPICS hardware:
-pip install pyepics
+pip install -r requirements.txt
 ```
+
+`pyepics` is only needed for real EPICS hardware; Simulation mode runs without it.
+
+### If you are installing into a venv built on Anaconda
+
+Pin Qt to the 6.6 series:
+
+```bash
+pip install "PyQt6==6.6.1" "PyQt6-Qt6==6.6.3"
+```
+
+PyQt6-Qt6 6.8 and newer are built against the VS2022 C runtime and ship their own
+`vcruntime140*.dll` / `msvcp140*.dll` (14.44). An Anaconda-based interpreter loads its
+own 14.29 copies at startup, before Qt gets a say, and Qt then fails with:
+
+```
+ImportError: DLL load failed while importing QtCore: The specified procedure could not be found.
+```
+
+`os.add_dll_directory` does not help — the conflicting DLL is already resident. Either pin
+Qt as above, or use a non-Anaconda Python. Pinning both packages matters: installing
+`PyQt6==6.6.1` alone leaves `PyQt6-Qt6` at whatever version was already present.
 
 ## Run
 
@@ -16,8 +36,15 @@ pip install pyepics
 py -3.9 dcm_align_app.py
 ```
 
-(On the beamline Windows box a bare `python` resolves to the Microsoft Store
-stub and fails; use the `py` launcher.)
+The `py` launcher is not present on every beamline box, and a bare `python` may resolve to
+the Microsoft Store stub and fail. If neither works, call the interpreter by absolute path.
+
+There is a second, much smaller GUI for a three-scan touch-up run — see
+[Mini Alignment Console](#mini-alignment-console) at the end of this file:
+
+```bash
+py -3.9 dcm_mini_app.py
+```
 
 ## Tabs
 
@@ -229,3 +256,122 @@ mono_e,ue,harmonic,roll,pitch,bpm_sen,ic_sen_unit,ic_sen_num
 8.0,8.02,1,-7670,1338,6,2,3
 10.0,10.03,1,-7671,1328,6,2,3
 ```
+
+---
+
+# Mini Alignment Console
+
+`dcm_mini_app.py` — a second, deliberately small GUI over the same codebase, for one
+specific job: a quick touch-up **at whatever energy the beamline is already at**.
+
+> **Status: under development.** This section describes the agreed design. The
+> environment notes and the pre-flight speed-up are in place; `dcm_mini_app.py` itself
+> lands in a follow-up commit. Nothing here has been run against real hardware yet.
+
+## Why it exists
+
+The motivating case is a beamline **with no DCM piezo**. That one fact drives the whole
+design:
+
+- the DCM pitch scan drives the **motor**, because there is no piezo to scan;
+- the **mirror** pitch piezo is the only remaining fine vertical actuator, so it is what
+  zeroes BPM y;
+- vertical feedback is **left off**, because the loop it normally closes has no actuator;
+- the full console's step 3A — centre the DCM pitch piezo at 5 — is meaningless here.
+
+The mini console never reads, writes or connect-tests `piezo_pitch` / `piezo_roll`, so it
+runs fine with those PV names blank or dead. The full console cannot do this job: its
+chapter 3 centres the DCM piezo and its pre-flight requires both piezo PVs.
+
+## The sequence
+
+No energy row is selected. Every scan starts from where its motor PV is *now*.
+
+| Step | Action |
+|------|--------|
+| 1 | Turn **vertical** feedback off (H is left alone, and never written) |
+| 2 | DCM pitch **motor** scan → maximum intensity on the **ion chamber** |
+| 3 | Read BPM x. Within the threshold (default **12 µm**) → **skip**. Otherwise scan the DCM roll **motor** → BPM x = 0 |
+| 4 | Mirror pitch **piezo** scan → BPM y = 0 |
+
+Both scans are documented steps: `steps.docx` lists "Pitch Scan → intensity peak" under
+Step 3 and "Mirror piezo pitch scan → BPM y = 0" under Step 5. What is new here is the live
+anchoring, the ion chamber as the detector, and the absent DCM piezo.
+
+Step 3 is the only conditional step. The decision is always logged **with the measured
+number**, and "skipped because already centred" is recorded distinctly from "skipped
+because the operator un-ticked it" — those mean different things.
+
+There is an optional step 5, **off by default**: a re-peak of the pitch motor after a roll
+move, mirroring the full console's 3D. 3D exists because a roll move perturbs the pitch
+peak; whether that matters here depends on the roll–pitch coupling of this DCM.
+
+### This is not "lock-in"
+
+The full console's 5C exists so that 5D can *engage* the V loop. With V left off, the mini
+run pre-positions the mirror piezo and **nothing closes**. The log and every run record say
+*"pre-positioned for V lock — V feedback NOT engaged"*, so no record can later be misread
+as a closed loop. Re-enabling vertical feedback is the operator's action.
+
+## What it refuses to do
+
+Each of these is a guard, not a warning:
+
+- **A blank `ion_chamber` PV refuses the run.** `_signal_pv` falls back to BPM intensity
+  when that name is empty, so a run could otherwise peak on the BPM while the log claimed
+  the ion chamber.
+- **No write leaves a declared travel window.** Each axis gets a window from its live
+  position plus a configured maximum excursion, and an out-of-window write is a *fault,
+  never a silent clamp* — a clamping `ao` record plus a scan that records demands rather
+  than readbacks would make the plot and the record lie.
+- **Drive limits are checked against the real scan budget**, not one scan width. The
+  zero-crossing scans walk with no fixed end and extend their budget on every retry. Which
+  limit fields to read is taken from the record type: a `motor` record has `.HLM`/`.LLM`,
+  an `ao` piezo has `.DRVH`/`.DRVL`.
+- **The mirror must be in the beam**, biased toward "in": a stage counts as out only once
+  it has travelled past a configurable fraction (default 0.5) of the way to its out
+  position. A stage that cannot be read is recorded as "could not verify", which is not the
+  same as "out".
+- **Nothing moves before pre-flight passes**, so a dead ion chamber stops the run *before*
+  vertical feedback is switched off.
+- **The V-feedback state is reported on every exit path** — success, PV fault, unexpected
+  exception, operator abort. The run most likely to leave the beamline in an odd state is
+  an aborted one, so that is exactly the run that must not stay quiet.
+
+The mini run writes **exactly five** PV names and no others: `auto_feedback`,
+`feedback_v`, `pitch`, `roll`, `mir_piezo_pitch` — and `roll` only when the BPM x threshold
+was exceeded.
+
+## Configuration
+
+The mini console reads the PV names and scan parameters the full console saved, and owns
+one new top-level section of `dcm_config.json`:
+
+```json
+"mini": {
+  "scan":    { "mini_bpm_x_threshold_um": 12.0, "...": "..." },
+  "records": [ { "timestamp": "...", "dcm_pitch_urad": 1338.42, "...": "..." } ]
+}
+```
+
+`mini.scan` holds the mini's own parameters, named `mini_*` so they can never silently
+override a value the full console's Setup tab edits. `mini.records` appends one row per
+run. Every numeric key carries its unit; `signal_pv` records *which* detector the peak was
+actually found on; and the BPM x threshold in force is stored per run, so a row read months
+later is interpretable on its own terms.
+
+Both applications preserve top-level keys they do not own and write via a temp file plus
+`os.replace`, so neither can delete the other's section or leave truncated JSON.
+
+### Run lock
+
+Both consoles drive the same motors. A lock file beside the config records which app is
+running, its pid, host and start time; each refuses to start a run while the other holds a
+live lock, naming the holder. A stale lock can be overridden.
+
+## Simulation
+
+The mini console has its own Simulation checkbox, defaulting to the `simulate` value in
+`dcm_config.json` but never writing it back. In simulation the guards that read drive
+limits are skipped — `EpicsInterface.get` returns `0.0` for any unset PV, so `DRVL` and
+`DRVH` would both read zero and a naive guard would refuse every simulated run.
