@@ -264,9 +264,10 @@ mono_e,ue,harmonic,roll,pitch,bpm_sen,ic_sen_unit,ic_sen_num
 `dcm_mini_app.py` — a second, deliberately small GUI over the same codebase, for one
 specific job: a quick touch-up **at whatever energy the beamline is already at**.
 
-> **Status: under development.** This section describes the agreed design. The
-> environment notes and the pre-flight speed-up are in place; `dcm_mini_app.py` itself
-> lands in a follow-up commit. Nothing here has been run against real hardware yet.
+> **Status: not yet run against hardware.** The module and its 48-check headless suite
+> (`tests/test_mini.py`) are in place and green, but this machine has no EPICS IOC, so
+> nothing below is verified against real records, real drive limits or real beam. Treat
+> the first hardware run as a commissioning run, with someone watching the beam.
 
 ## Why it exists
 
