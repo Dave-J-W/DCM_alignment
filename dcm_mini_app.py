@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QCheckBox, QLabel, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
+from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt
 
 import dcm_align_app as app
 
@@ -985,6 +985,10 @@ class MiniWindow(QMainWindow):
         root.addWidget(bpm_box)
 
         self._fig_pane = app.FigurePane("Mini", list(self._models.values()))
+        # FigurePane elides tab text, which earns its keep in the main console
+        # where two panes share a splitter. Here there is one full-width pane
+        # with three short labels, and eliding rendered them "Pit… / R… / Pie…".
+        self._fig_pane.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
         root.addWidget(self._fig_pane, 1)
 
         self.log = app.LogWidget()
