@@ -130,25 +130,37 @@ R.check(v_writes and all(float(v) == 0 for v in v_writes),
 # That single write is the whole property under test here.
 pitch_writes = [v for pv, v in WRITES if pv == pvs["pitch"]]
 R.check(len(pitch_writes) >= 1, "the pitch motor is written at all")
-peak = win._models["mini_pitch"].get("m_pitch")
-R.check(peak is not None and peak.marker is not None,
-        "the pitch figure carries a peak marker")
-if peak is not None and peak.marker is not None and pitch_writes:
-    R.check(abs(float(pitch_writes[-1]) - float(peak.marker)) < 1e-6,
+# The adaptive scan runs several passes, each its own trace, and the peak
+# marker belongs to whichever pass produced the reported result -- so look for
+# it across the figure rather than assuming it sits on the first trace.
+marked = [s for s in win._models["mini_pitch"].order() if s.marker is not None]
+R.check(len(marked) == 1,
+        "exactly one pitch trace carries the peak marker (got %d)" % len(marked))
+if marked and pitch_writes:
+    R.check(abs(float(pitch_writes[-1]) - float(marked[0].marker)) < 1e-6,
             "the last pitch write equals the marked peak (%.6g vs %.6g)"
-            % (pitch_writes[-1], peak.marker))
+            % (pitch_writes[-1], marked[0].marker))
 
 piezo_writes = [v for pv, v in WRITES if pv == pvs["mir_piezo_pitch"]]
-zero = win._models["mini_piezo"].get("m_piezo")
-if zero is not None and zero.marker is not None and piezo_writes:
+zero = next((s for s in win._models["mini_piezo"].order()
+             if s.marker is not None), None)
+if zero is not None and piezo_writes:
     R.check(abs(float(piezo_writes[-1]) - float(zero.marker)) < 1e-6,
             "the last mirror-piezo write equals the marked zero crossing")
 
 # ═══ 7. figures are monotonic in x where they should be ════════════════════
 pf = win._models["mini_pitch"].get("m_pitch")
 R.check(pf is not None and len(pf.xs) >= 2, "the pitch figure received points")
-if pf is not None:
-    R.check(pf.xs == sorted(pf.xs), "pitch figure x values are sorted")
+# The property that matters: a scan pass measures each x once, so within a
+# single trace x must be strictly increasing. Duplicated x values are what
+# made the old single-trace plot zigzag when a fine pass re-measured the
+# region a coarse pass had already covered.
+for figname in ("mini_pitch", "mini_roll", "mini_piezo"):
+    for sr in win._models[figname].order():
+        strictly_up = all(b > a for a, b in zip(sr.xs, sr.xs[1:]))
+        R.check(strictly_up,
+                "%s / %r: x is strictly increasing within the trace"
+                % (figname, sr.label))
 
 # ═══ 8. V-feedback state is announced ══════════════════════════════════════
 logtext = win.log.toPlainText()

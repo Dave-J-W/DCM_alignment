@@ -1142,6 +1142,7 @@ class MiniWindow(QMainWindow):
         self._worker.substep_status.connect(self._on_substep_status)
         self._worker.scan_point.connect(self._on_scan_point)
         self._worker.scan_peak.connect(self._on_scan_peak)
+        self._worker.scan_fit.connect(self._on_scan_fit)
         self._worker.bpm_update.connect(self._on_bpm_update)
         self._worker.feedback_update.connect(self._on_feedback)
         self._worker.pv_fault.connect(self._on_pv_fault)
@@ -1182,7 +1183,19 @@ class MiniWindow(QMainWindow):
         self._set_step_tag(key, status)
 
     def _route(self, key):
-        return _MINI_SCAN_ROUTES.get(key)
+        """_MINI_SCAN_ROUTES entry for a series key, resolved by stripping any
+        "#<pass>" suffix _smart_scan_peak's passes 2+ append (m_pitch and
+        m_pitch2 are the only mini scans that call it). The label is
+        extended to name the pass when the key carries one, mirroring
+        ScanPlotBoard._route in the full console."""
+        base, _, suffix = key.partition("#")
+        route = _MINI_SCAN_ROUTES.get(base)
+        if route is None:
+            return None
+        fig_id, label, marker_kind = route
+        if suffix:
+            label = f"{label} · pass {suffix}"
+        return fig_id, label, marker_kind
 
     def _on_scan_point(self, key, x, y):
         route = self._route(key)
@@ -1197,6 +1210,13 @@ class MiniWindow(QMainWindow):
             return
         fig_id, label, marker_kind = route
         self._models[fig_id].set_marker(key, label, value, marker_kind)
+
+    def _on_scan_fit(self, key, xs, ys):
+        route = self._route(key)
+        if route is None:
+            return
+        fig_id, _label, _marker_kind = route
+        self._models[fig_id].set_fit(key, xs, ys)
 
     def _on_bpm_update(self, x, y, intensity):
         self._bpm_labels["bpm_x"].setText("%+.4f" % x)

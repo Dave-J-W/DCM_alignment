@@ -122,15 +122,29 @@ for skip in (True, False):
 app.EpicsInterface.put = _real_put
 
 # ── Figure routing. The loop above ended on a skip_mirror=False run, so every
-#    figure should be populated and the two overlay pairs should each hold two
-#    traces. "pitch" used to be one key shared by the DCM pitch motor and the
-#    DCM pitch piezo, concatenating incompatible x scales into one polyline.
+#    figure should be populated. "pitch" used to be one key shared by the DCM
+#    pitch motor and the DCM pitch piezo, concatenating incompatible x scales
+#    into one polyline.
 board = win.alignment_tab._plot_board
 
-# dcm_pitch overlays 3B+3D. mir_pitch (4C, µrad motor) and mir_piezo (5C, DCOM
-# piezo) are deliberately separate: since 4C moved to the pitch motor they no
-# longer share an x quantity and must not share an axis.
-for fig_id, expected in (("dcm_pitch", 2), ("mir_pitch", 1), ("mir_piezo", 1)):
+# dcm_pitch overlays 3B+3D, and each of those is now drawn as one trace per
+# scan PASS (AlignmentWorker._smart_scan_peak): the coarse scan, then however
+# many fine re-measurements it took to converge. The exact pass count is not
+# pinned down -- it depends on how quickly the fit converges -- but every
+# trace on the figure must trace back to one of the two substeps that feed
+# it, and splitting into passes must produce MORE traces than the old
+# one-trace-per-substep behaviour, not the same or fewer.
+dcm_pitch_series = board.model("dcm_pitch").order()
+dcm_pitch_bases = sorted({sr.key.split("#", 1)[0] for sr in dcm_pitch_series})
+R.check(dcm_pitch_bases == ["3_3b", "3_3d"] and len(dcm_pitch_series) > 2,
+        "figure 'dcm_pitch' carries one trace per scan pass of 3B and 3D "
+        "(%d trace(s): %s)" % (len(dcm_pitch_series), [sr.key for sr in dcm_pitch_series]))
+
+# mir_pitch (4C, µrad motor) and mir_piezo (5C, DCOM piezo) are single-pass
+# _scan_to_zero scans -- never split into passes -- and deliberately separate
+# figures: since 4C moved to the pitch motor they no longer share an x
+# quantity and must not share an axis.
+for fig_id, expected in (("mir_pitch", 1), ("mir_piezo", 1)):
     got = len(board.model(fig_id).order())
     R.check(got == expected,
             "figure %r carries %d trace(s) (got %d)" % (fig_id, expected, got))
@@ -143,21 +157,40 @@ empty = [f[0] for f in app._FIGURE_DEFS if board.model(f[0]).is_empty()]
 R.check(not empty,
         "every figure received its scan%s" % (" (empty: %s)" % empty if empty else ""))
 
-labels = sorted(sr.label for f in app._FIGURE_DEFS
-                for sr in board.model(f[0]).order())
-R.check(len(labels) == len(set(labels)) == 9,
-        "all nine scans are separately labelled: %s" % labels)
+# Every one of the nine routed scans must be represented by at least one
+# trace (stripping any "#<pass>" suffix down to its substep key), and no two
+# traces anywhere on the board -- across passes and across figures -- may
+# share a legend label.
+base_keys = sorted({sr.key.split("#", 1)[0] for f in app._FIGURE_DEFS
+                    for sr in board.model(f[0]).order()})
+R.check(base_keys == sorted(app._SCAN_ROUTES),
+        "all nine scans are represented on their figures: %s" % base_keys)
 
-colours_ok = all(len({sr.color for sr in board.model(f[0]).order()})
-                 == len(board.model(f[0]).order()) for f in app._FIGURE_DEFS)
-R.check(colours_ok, "traces sharing a figure have distinct colours")
+labels = [sr.label for f in app._FIGURE_DEFS for sr in board.model(f[0]).order()]
+R.check(len(labels) == len(set(labels)),
+        "every trace has a distinct legend entry: %s" % labels)
 
+# Distinct colours per figure -- unless a figure now legitimately carries
+# more passes than the fixed-size colour palette, in which case colours must
+# repeat and that repetition is not a bug.
+colours_ok = all(
+    len({sr.color for sr in board.model(f[0]).order()}) == len(board.model(f[0]).order())
+    or len(board.model(f[0]).order()) > len(app.SERIES_COLORS)
+    for f in app._FIGURE_DEFS)
+R.check(colours_ok, "traces sharing a figure have distinct colours "
+        "(unless there are more passes than palette colours)")
+
+# The property that actually matters, and the one the old interleaved-passes
+# bug violated: a scan pass measures each x once, so within any one trace x
+# must be strictly increasing, with no x value repeated. Duplicated x is
+# exactly what a fine pass re-measuring a coarse pass's region produced when
+# both passes shared one trace.
 unsorted_series = [sr.label for f in app._FIGURE_DEFS
                    for sr in board.model(f[0]).order()
-                   if any(b < a for a, b in zip(sr.xs, sr.xs[1:]))]
+                   if any(b <= a for a, b in zip(sr.xs, sr.xs[1:]))]
 R.check(not unsorted_series,
-        "every trace is monotonic in x%s"
-        % (" (zig-zag: %s)" % unsorted_series if unsorted_series else ""))
+        "every trace's x is strictly increasing with no duplicates%s"
+        % (" (bad: %s)" % unsorted_series if unsorted_series else ""))
 
 R.check(all(len(sr.raw) == len(sr.xs) for f in app._FIGURE_DEFS
             for sr in board.model(f[0]).order()),
