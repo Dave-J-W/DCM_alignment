@@ -2201,6 +2201,12 @@ class AlignmentWorker(QObject):
                 pitch_coarse = row["pitch"]
                 self.log("  INSUFFICIENT DATA: using table pitch value as fallback", "warn")
             self._write(pvs['pitch'], pitch_coarse, "3B — move pitch to the coarse peak")
+            # pitch is a motor record, so _write returns as soon as the setpoint
+            # is accepted. Without this wait 3C started scanning roll while the
+            # pitch stage was still travelling, so its BPM x readings were taken
+            # mid-move -- the scan result was applied but never actually reached
+            # before the next step measured against it.
+            if not self._wait_motor_done(pvs['pitch']): return self._abort_cleanup()
             self.log(f"  Intensity peak at pitch = {pitch_coarse:.6f} → moved", "ok")
             self.substep_status.emit("3_3b", "waiting")
             if not self.request_confirm("3_3b"): return self._abort_cleanup()
@@ -2232,6 +2238,7 @@ class AlignmentWorker(QObject):
                 roll_zero = row["roll"]
                 self.log("  INSUFFICIENT DATA: using table roll value as fallback", "warn")
             self._write(pvs['roll'], roll_zero, "3C — move roll to the BPM x zero-crossing")
+            if not self._wait_motor_done(pvs['roll']): return self._abort_cleanup()
             self.log(f"  BPM x zero-crossing at roll = {roll_zero:.6f} → moved", "ok")
             self.substep_status.emit("3_3c", "waiting")
             if not self.request_confirm("3_3c"): return self._abort_cleanup()
@@ -2258,6 +2265,11 @@ class AlignmentWorker(QObject):
                 pitch_peak = pitch_coarse
                 self.log("  INSUFFICIENT DATA: using coarse pitch value as fallback", "warn")
             self._write(pvs['pitch'], pitch_peak, "3D — move pitch to the fine peak")
+            # Especially important here: the snapshot block right after chapter 3
+            # reads BPM y, BPM intensity and the ion chamber into the lookup
+            # table. Without this wait those were recorded while pitch was still
+            # moving, so the table stored a value from the wrong position.
+            if not self._wait_motor_done(pvs['pitch']): return self._abort_cleanup()
             self.log(f"  Intensity peak at pitch = {pitch_peak:.6f} → moved", "ok")
             self.bpm_update.emit(roll_zero + random.uniform(-0.0005, 0.0005),
                                  random.uniform(-0.001, 0.001), 0.97)
@@ -2546,27 +2558,14 @@ class AlignmentWorker(QObject):
         # ── Step 5: Enable feedback loops ──────────────────────────────
         self._begin_chapter(5, "Enable feedback loops")
 
-        # Insert the mirror if it is actually still out. Keying this on
-        # skip_mirror was wrong once individual steps could be switched off:
-        # disabling 4B alone left the mirror out with nothing putting it back.
+        # The Step 5 "mirror in" substep was removed deliberately. Inserting
+        # the mirror here silently undid a decision the operator had already
+        # made by unticking 4B, and it moved eight stages -- including a ~60 s
+        # CRL Y travel -- at the point in the run where feedback is about to be
+        # handed back. If the mirror needs to be in, run 4B.
         if not self._mirror_in:
-            if not self._skip("5_5mir"):
-                self.substep_status.emit("5_5mir", "running")
-                self.log("  Mirror is out — moving it into the beam path now…")
-                for stage in self.mirror_stages:
-                    if stage["pv"].strip():
-                        self._write(stage["pv"], stage["val_in"],
-                                    f"5 — move {stage['name']} IN")
-                        self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
-                        if not self._sleep(0.1): return self._abort_cleanup()
-                if not self._wait_all_motors([st["pv"] for st in self.mirror_stages],
-                                             "mirror stages"):
-                    return self._abort_cleanup()
-                self._mirror_in = True
-                self.log("  Mirror in position.", "ok")
-                if not self._apply_mirror_stripe(float(self.row.get("mono_e", 0))):
-                    return self._abort_cleanup()
-                self.substep_status.emit("5_5mir", "done")
+            self.log("  NOTE: the mirror is not in the beam path. Step 5 no "
+                     "longer inserts it -- run 4B if it is needed.", "warn")
 
         # Close the JJC to its operating size before the feedback loops run.
         # The alignment itself is done with the JJC wide open at 4; 0.4 is the
@@ -4548,7 +4547,6 @@ class AlignmentTab(QWidget):
         "4_4D": "VDM:Y scan → peak",
         "4_4E": "Coupled VFM:Y+VDM:Y → peak",
         "4_4F": "Open mirror slits",
-        "5_5mir": "Mirror in",
         "5_5jjc": "Close JJC slit before feedback",
         "5_5a": "Turn on H feedback",
         "5_5b": "DCM piezo pitch scan → max intensity",
@@ -4692,8 +4690,7 @@ class AlignmentTab(QWidget):
               ("4E", "Coupled VFM:Y+VDM:Y → peak"),
               ("4F", "Open mirror slits")]),
             (5, "Enable Feedback Loops",
-             [("5mir", "Mirror in"),
-              ("5jjc", "Close JJC slit before feedback"),
+             [              ("5jjc", "Close JJC slit before feedback"),
               ("5a", "Turn on H feedback"),
               ("5b", "DCM piezo pitch scan → max intensity"),
               ("5c", "Mirror piezo pitch scan → BPM y = 0"),
@@ -4897,11 +4894,24 @@ class AlignmentTab(QWidget):
     def _run_chapter(self, step_num):
         """Run one chapter on its own, leaving the tick boxes as they are.
 
-        Chapter 1 rides along because it only logs the selected row, which is
-        useful context at the top of the log.
+        The tick boxes override: this runs the ticked substeps of that chapter,
+        not all of them. Unticking a scan and then pressing the chapter's play
+        button used to run it anyway, which is the opposite of what the tick
+        box says. A chapter with nothing ticked therefore does nothing at all.
+
+        Chapter 1 rides along when it is ticked, because it only logs the
+        selected row and that is useful context at the top of the log.
         """
-        keys = set(self._chapter_steps.get(step_num, []))
-        keys |= set(self._chapter_steps.get(1, []))
+        ticked = self.enabled_keys()
+        keys = set(self._chapter_steps.get(step_num, [])) & ticked
+        if not keys:
+            QMessageBox.information(
+                self, "Nothing ticked in this chapter",
+                "Every step in chapter %d is unticked, so its play button has "
+                "nothing to run.\n\nTick at least one step first." % step_num)
+            return
+        if step_num != 1:
+            keys |= set(self._chapter_steps.get(1, [])) & ticked
         self.run_requested.emit(keys)
 
     def _refresh_stripe_display(self):
